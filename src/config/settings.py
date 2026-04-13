@@ -178,6 +178,17 @@ class Settings(BaseSettings):
     database_url: str = Field(
         DEFAULT_DATABASE_URL, description="Database connection URL"
     )
+
+    # RA-924 — Supabase durable session persistence.
+    # When both vars are set, SupabaseSessionStorage replaces SQLiteSessionStorage
+    # so Claude session IDs survive Railway redeploys (fixes cold-start context loss).
+    supabase_url: Optional[str] = Field(
+        None, description="Supabase project URL (e.g. https://xyz.supabase.co)"
+    )
+    supabase_service_key: Optional[SecretStr] = Field(
+        None, description="Supabase service-role secret key for server-side writes"
+    )
+
     session_timeout_hours: int = Field(
         DEFAULT_SESSION_TIMEOUT_HOURS, description="Session timeout"
     )

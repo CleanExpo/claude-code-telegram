@@ -37,6 +37,7 @@ from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
+from src.storage.supabase_session_storage import SupabaseSessionStorage
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -136,8 +137,19 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
     audit_logger = AuditLogger(audit_storage)
 
-    # Create Claude integration components with persistent storage
-    session_storage = SQLiteSessionStorage(storage.db_manager)
+    # RA-924 — Create Claude integration components with durable session storage.
+    # Use Supabase when both SUPABASE_URL and SUPABASE_SERVICE_KEY are set —
+    # sessions then survive Railway redeploys (no cold-start context loss).
+    # Fall back to SQLite for local development or when vars are absent.
+    if config.supabase_url and config.supabase_service_key:
+        session_storage = SupabaseSessionStorage(
+            supabase_url=config.supabase_url,
+            service_key=config.supabase_service_key.get_secret_value(),
+        )
+        logger.info("Session storage: Supabase (durable across redeploys)")
+    else:
+        session_storage = SQLiteSessionStorage(storage.db_manager)
+        logger.info("Session storage: SQLite (ephemeral — set SUPABASE_URL + SUPABASE_SERVICE_KEY for durability)")
     session_manager = SessionManager(config, session_storage)
 
     # Create Claude SDK manager and integration facade
