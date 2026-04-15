@@ -101,8 +101,15 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments — ALL .env variants (never commit credentials)
 .env
+.env.*
+!.env.example
+!.env.*.example
+.env.railway
+.env.local
+.env.production
+.env.staging
 .venv
 env/
 venv/
