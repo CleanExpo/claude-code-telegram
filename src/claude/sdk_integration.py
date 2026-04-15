@@ -250,13 +250,23 @@ class ClaudeSDKManager:
         self.config = config
         self.security_validator = security_validator
 
-        # Set up environment for Claude Code SDK if API key is provided
+        # Set up environment for Claude Code SDK if API key is provided.
         # If no API key is provided, the SDK will use existing CLI authentication
+        # (OAuth tokens stored in ~/.claude/).
+        #
+        # IMPORTANT: The claude CLI sets ANTHROPIC_API_KEY="" in the parent shell
+        # as a security measure.  If we leave that empty string in the environment,
+        # the Claude subprocess inherits it and sends it as the x-api-key header,
+        # causing HTTP 401.  Explicitly unset it when we're relying on CLI auth so
+        # the subprocess picks up its own OAuth session instead.
         if config.anthropic_api_key_str:
             os.environ["ANTHROPIC_API_KEY"] = config.anthropic_api_key_str
             logger.info("Using provided API key for Claude SDK authentication")
         else:
-            logger.info("No API key provided, using existing Claude CLI authentication")
+            # Clear the env var — an empty string is worse than absent because the
+            # SDK treats it as "use this key" rather than "use CLI auth".
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            logger.info("No API key provided — cleared ANTHROPIC_API_KEY, using CLI auth")
 
     def _is_retryable_error(self, exc: BaseException) -> bool:
         """Return True for transient errors that warrant a retry.

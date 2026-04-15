@@ -345,6 +345,23 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
+    @field_validator("anthropic_api_key", mode="before")
+    @classmethod
+    def sanitize_api_key(cls, v: Any) -> Optional[str]:
+        """Treat empty strings and unresolved 1Password references as absent.
+
+        The claude CLI sets ANTHROPIC_API_KEY="" in the shell env, and local
+        .env files may contain 1Password-style 'op://...' references that are
+        only resolved when launched via 'op run --'.  Both cases should fall
+        through to CLI auth rather than attempt API auth with an invalid value.
+        """
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.startswith("op://"):
+            return None
+        return s
+
     @field_validator("allowed_users", "notification_chat_ids", mode="before")
     @classmethod
     def parse_int_list(cls, v: Any) -> Optional[List[int]]:
