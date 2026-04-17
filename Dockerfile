@@ -8,8 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-RUN pip install poetry==1.8.3
+# Install Poetry — version 2.x required because pyproject.toml uses
+# package-mode=false (Poetry 2.x feature) and poetry.lock is 2.x format.
+# RA-1101: pinned to a specific 2.x to avoid silent upgrades.
+RUN pip install poetry==2.3.4
 
 # Copy dependency files
 COPY pyproject.toml poetry.lock ./
