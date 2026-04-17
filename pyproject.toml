@@ -35,6 +35,10 @@ requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
+# RA-1101: Poetry 2.x requires explicit metadata at [tool.poetry] level OR
+# package-mode = false. We're an application (not a publishable library),
+# so package-mode = false is the correct fix.
+package-mode = false
 packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
