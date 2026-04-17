@@ -318,7 +318,7 @@ class MessageOrchestrator:
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command
+        from .handlers import command, remote_control
 
         # Commands
         handlers = [
@@ -328,6 +328,10 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            # RA-1101 — iPhone/iPad remote control
+            ("projects", remote_control.projects_command),
+            ("health", remote_control.health_command),
+            ("idea", remote_control.idea_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -396,6 +400,15 @@ class MessageOrchestrator:
             )
         )
 
+        # RA-1101 — proj: callbacks for the /projects InlineKeyboard dropdown
+        from .handlers import remote_control
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(remote_control.projects_callback),
+                pattern=r"^proj:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -460,6 +473,10 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                # RA-1101 — iPhone/iPad remote control
+                BotCommand("projects", "Pick a project (tappable dropdown)"),
+                BotCommand("health", "Portfolio health (all projects)"),
+                BotCommand("idea", "Capture an idea for the next board meeting"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
