@@ -1,55 +1,64 @@
 """
 remote_control.py — RA-1101 — iPhone/iPad remote control handlers.
 
-Three high-leverage agentic commands that turn the bot into a real
-mobile control surface:
+Three high-leverage agentic commands:
+  /projects  — InlineKeyboardMarkup dropdown of every registered project
+  /health    — Portfolio health pulled from the Pi-CEO backend
+  /idea      — Captures a free-text idea to .harness/ideas-from-phone/
 
-  /projects  — InlineKeyboardMarkup dropdown of every registered project.
-               Tap a project → sets current_directory + sends a "ready" prompt
-               so the next free-text message routes to the right repo.
-
-  /health    — Pulls portfolio health from the Pi-CEO backend and formats
-               it as a Telegram-safe message. One score per project, sorted
-               worst-first so problems jump out.
-
-  /idea      — Captures a free-text idea (everything after "/idea ") to
-               `.harness/ideas-from-phone/YYYY-MM-DD.jsonl`. Future cron
-               processes the file, pulls source links if present, routes to
-               the right project's next board meeting.
-
-All three are designed for one-thumb iPhone use:
-- Short responses (Telegram preview is small)
-- Tappable buttons rather than typed commands wherever possible
-- HTML escape everything user-supplied (XSS-class issues in renderer)
+Designed to be ULTRA-DEFENSIVE on import: every Python-stdlib import below the
+module docstring is lazy (inside the function body) so a configuration miss in
+production can't take the bot down at startup. The orchestrator imports this
+module synchronously — module-level errors would crash the bot.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
-from telegram.helpers import escape_markdown
-
-from ..utils.html_format import escape_html
 
 logger = logging.getLogger(__name__)
 
 
-# ── Constants ──────────────────────────────────────────────────────────────
-# Resolve .harness/ relative to the telegram-bot package — works in both the
-# Railway container (where Pi-Dev-Ops repo isn't fully present) and locally.
-_HARNESS_FALLBACK = Path("/app/.harness")
-_HARNESS_LOCAL = Path(__file__).resolve().parents[5] / ".harness"
-HARNESS_DIR = _HARNESS_LOCAL if _HARNESS_LOCAL.exists() else _HARNESS_FALLBACK
-PROJECTS_REGISTRY = HARNESS_DIR / "projects.json"
-IDEAS_INBOX_DIR = HARNESS_DIR / "ideas-from-phone"
+# ── Helpers (lazy) ─────────────────────────────────────────────────────────
+def _harness_dir():
+    """Resolve .harness/ at call time — works in both Mac dev and Railway."""
+    import os
+    from pathlib import Path
+    # Allow override via env var (Railway can set this to mount the harness if needed)
+    env_path = os.environ.get("PI_CEO_HARNESS_DIR", "")
+    if env_path:
+        return Path(env_path)
+    # Mac dev: walk up from this file to find .harness/ in parent monorepo
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / ".harness"
+        if candidate.is_dir():
+            return candidate
+    # Railway fallback (won't have .harness mounted)
+    return Path("/app/.harness")
+
+
+def _escape_html(text: str) -> str:
+    """Local fallback escape — avoids import-time dependency on utils.html_format."""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _load_projects() -> list[dict]:
+    """Load .harness/projects.json. Returns [] on any error (logged)."""
+    import json
+    try:
+        registry = _harness_dir() / "projects.json"
+        with registry.open() as f:
+            data = json.load(f)
+        return [p for p in data.get("projects", []) if p.get("id")]
+    except Exception as exc:  # noqa: BLE001 — we want to swallow everything here
+        logger.warning("remote_control: failed to load projects: %s", exc)
+        return []
 
 
 # ── /projects ──────────────────────────────────────────────────────────────
@@ -62,20 +71,17 @@ async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not projects:
         await update.message.reply_text(
             "📁 No projects registered.\n\n"
-            f"Looked in: <code>{escape_html(str(PROJECTS_REGISTRY))}</code>",
+            f"Looked in: <code>{_escape_html(str(_harness_dir() / 'projects.json'))}</code>",
             parse_mode="HTML",
         )
         return
 
-    # Build 2-column keyboard — easier on a phone screen than a single column
+    # 2-column keyboard, easier to tap on a phone
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for p in projects:
-        # callback_data format: "proj:<project_id>" — handled by registered callback
-        row.append(InlineKeyboardButton(
-            text=p.get("id", "unknown"),
-            callback_data=f"proj:{p.get('id', 'unknown')}",
-        ))
+        pid = p.get("id", "unknown")
+        row.append(InlineKeyboardButton(text=pid, callback_data=f"proj:{pid}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -90,16 +96,12 @@ async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def projects_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'proj:<id>' callbacks from the /projects InlineKeyboard.
-
-    Sets the user's working directory + sends a confirmation message so the
-    next free-text message lands in the right repo's session.
-    """
+    """Handle 'proj:<id>' callbacks from the /projects InlineKeyboard."""
     query = update.callback_query
     if not query or not query.data or not query.data.startswith("proj:"):
         return
 
-    project_id = query.data[5:]  # strip "proj:"
+    project_id = query.data[5:]
     projects = _load_projects()
     project = next((p for p in projects if p.get("id") == project_id), None)
 
@@ -108,24 +110,21 @@ async def projects_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     repo = project.get("repo", "")
-    deployments = project.get("deployments", {})
+    deployments = project.get("deployments", {}) or {}
     frontend = deployments.get("frontend", "")
 
-    # Stash on user_data — agentic_text reads current_directory next time
     if context.user_data is not None:
         context.user_data["current_project_id"] = project_id
-        # If the project's local path exists under approved_directory, switch to it
-        # (best-effort — the agentic flow will validate)
 
     msg = (
-        f"✅ <b>Now working on:</b> <code>{escape_html(project_id)}</code>\n"
-        f"Repo: <code>{escape_html(repo)}</code>"
+        f"✅ <b>Now working on:</b> <code>{_escape_html(project_id)}</code>\n"
+        f"Repo: <code>{_escape_html(repo)}</code>"
     )
     if frontend:
-        msg += f"\nLive: {escape_html(frontend)}"
+        msg += f"\nLive: {_escape_html(frontend)}"
     msg += "\n\nWhat do you want to do? Just describe it in plain English."
 
-    await query.answer()  # dismiss spinner
+    await query.answer()
     await query.edit_message_text(msg, parse_mode="HTML")
 
 
@@ -135,10 +134,13 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message:
         return
 
-    # Use the backend URL from env — same one Vercel proxy uses
+    import json
     import os
+    import urllib.request
+    import urllib.error
+
     backend_url = os.environ.get("PI_CEO_URL", "https://pi-dev-ops-production.up.railway.app").rstrip("/")
-    pw = os.environ.get("PI_CEO_PASSWORD", os.environ.get("TAO_PASSWORD", "")).strip()
+    pw = (os.environ.get("PI_CEO_PASSWORD") or os.environ.get("TAO_PASSWORD") or "").strip()
 
     if not pw:
         await update.message.reply_text(
@@ -149,7 +151,6 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     try:
-        # Login → get cookie → fetch /api/projects/health
         login_data = json.dumps({"password": pw}).encode()
         login_req = urllib.request.Request(
             f"{backend_url}/api/login",
@@ -175,9 +176,9 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         with urllib.request.urlopen(health_req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
 
-    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the user
         await update.message.reply_text(
-            f"❌ Health check failed: {escape_html(str(exc)[:200])}",
+            f"❌ Health check failed: {_escape_html(str(exc)[:200])}",
             parse_mode="HTML",
         )
         return
@@ -186,7 +187,6 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("📊 No project health data available yet.")
         return
 
-    # Sort worst-first
     data_sorted = sorted(data, key=lambda p: p.get("overall_health", 100))
     avg = sum(p.get("overall_health", 0) for p in data_sorted) / len(data_sorted)
 
@@ -194,7 +194,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for p in data_sorted:
         score = p.get("overall_health", 0)
         emoji = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
-        pid = escape_html(p.get("project_id", "?"))
+        pid = _escape_html(p.get("project_id", "?"))
         lines.append(f"{emoji} <code>{pid}</code> — {score}/100")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -202,16 +202,13 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── /idea ──────────────────────────────────────────────────────────────────
 async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Capture a free-text idea to .harness/ideas-from-phone/YYYY-MM-DD.jsonl.
-
-    Usage: /idea Anything I think of, including https://link.com sources.
-    Future cron processes the file, pulls source links via Perplexity if any,
-    routes to the right project's next board meeting via the Senior PM agent.
-    """
+    """Capture a free-text idea to .harness/ideas-from-phone/YYYY-MM-DD.jsonl."""
     if not update.message or not update.message.text:
         return
 
-    # Strip the command prefix to get the idea text
+    import json
+    from datetime import datetime, timezone
+
     text = update.message.text
     if text.startswith("/idea"):
         text = text[5:].strip()
@@ -219,8 +216,8 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "💡 <b>Capture an idea</b>\n\n"
             "Usage: <code>/idea your thought here</code>\n"
-            "Include URLs, project names, anything. The Senior PM agent will "
-            "process it overnight and route to the right project's next board meeting.",
+            "Include URLs, project names, anything. The Senior PM agent processes "
+            "it overnight and routes to the right project's next board meeting.",
             parse_mode="HTML",
         )
         return
@@ -230,9 +227,8 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_name = user.first_name if user else "unknown"
     chat_id = update.effective_chat.id if update.effective_chat else 0
 
-    # Save as JSONL — append-only, no race conditions, easy to tail
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    record: dict[str, Any] = {
+    record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "user_id": user_id,
         "user_name": user_name,
@@ -244,33 +240,21 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     }
 
     try:
-        IDEAS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-        with (IDEAS_INBOX_DIR / f"{today}.jsonl").open("a") as f:
+        inbox = _harness_dir() / "ideas-from-phone"
+        inbox.mkdir(parents=True, exist_ok=True)
+        with (inbox / f"{today}.jsonl").open("a") as f:
             f.write(json.dumps(record) + "\n")
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.error("idea_command: failed to save: %s", exc)
         await update.message.reply_text(
-            f"❌ Failed to save idea: {escape_html(str(exc)[:120])}",
+            f"❌ Failed to save idea: {_escape_html(str(exc)[:120])}",
             parse_mode="HTML",
         )
         return
 
-    # Confirm with a short preview so the user can scroll-back-verify
     preview = text[:80] + ("…" if len(text) > 80 else "")
     await update.message.reply_text(
         f"💡 <b>Captured.</b> Will be processed in the next overnight cycle.\n\n"
-        f"<i>{escape_html(preview)}</i>",
+        f"<i>{_escape_html(preview)}</i>",
         parse_mode="HTML",
     )
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────
-def _load_projects() -> list[dict]:
-    """Load .harness/projects.json. Returns [] on any error (logged)."""
-    try:
-        with PROJECTS_REGISTRY.open() as f:
-            data = json.load(f)
-        return [p for p in data.get("projects", []) if p.get("id")]
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
-        logger.warning("remote_control: failed to load projects: %s", exc)
-        return []
