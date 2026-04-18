@@ -201,12 +201,82 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ── /idea ──────────────────────────────────────────────────────────────────
+# RA-1404 — Two-stage capture:
+#   (1) Post directly to Linear at call time. Returns RA-xxxx + URL in the reply.
+#       Removes the ~12h gap from the old GitHub Actions cron flow AND removes
+#       the dependency on .harness/ideas-from-phone/ being mounted into the
+#       Railway container (it isn't — the old writer wrote to an ephemeral
+#       /app/.harness/ path that was never pushed to git).
+#   (2) Always append to .harness/ideas-from-phone/YYYY-MM-DD.jsonl as a local
+#       audit trail. If stage (1) fails, the user sees the failure and still
+#       has the audit entry. If both fail, the user sees a clear error.
+_LINEAR_API_URL = "https://api.linear.app/graphql"
+# Default triage: RestoreAssist team → Pi-Dev-Ops project (canonical in CLAUDE.md)
+_DEFAULT_TEAM_ID = "a8a52f07-63cf-4ece-9ad2-3e3bd3c15673"
+_DEFAULT_PROJECT_ID = "f45212be-3259-4bfb-89b1-54c122c939a7"
+
+
+def _linear_create_issue_from_idea(
+    api_key: str, text: str, user_name: str, user_id: int, chat_id: int, message_id: int
+) -> tuple[bool, str, str]:
+    """POST a Linear issue. Returns (ok, identifier_or_error, url).
+
+    Stdlib-only to keep the bot's dependency surface minimal.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    title = text.splitlines()[0][:250] if text else "(empty idea)"
+    description = (
+        f"Captured via Telegram `/idea` from **{user_name}** "
+        f"(tg_user={user_id}, tg_chat={chat_id}, tg_msg={message_id}).\n\n"
+        f"---\n\n{text}"
+    )
+    query = (
+        "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { "
+        "success issue { identifier url } } }"
+    )
+    variables = {
+        "input": {
+            "teamId": _DEFAULT_TEAM_ID,
+            "projectId": _DEFAULT_PROJECT_ID,
+            "title": title,
+            "description": description,
+            "priority": 3,  # Normal — triage queue
+        }
+    }
+    payload = _json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(
+        _LINEAR_API_URL,
+        data=payload,
+        headers={"Authorization": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}: {exc.reason}", ""
+    except Exception as exc:  # noqa: BLE001 — stdlib can raise many; surface all
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}", ""
+
+    if data.get("errors"):
+        return False, str(data["errors"])[:200], ""
+    result = (data.get("data") or {}).get("issueCreate") or {}
+    if not result.get("success"):
+        return False, "issueCreate.success=false", ""
+    issue = result.get("issue") or {}
+    return True, issue.get("identifier", "?"), issue.get("url", "")
+
+
 async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Capture a free-text idea to .harness/ideas-from-phone/YYYY-MM-DD.jsonl."""
+    """Capture an idea: create a Linear ticket immediately + append JSONL audit trail."""
     if not update.message or not update.message.text:
         return
 
     import json
+    import os
     from datetime import datetime, timezone
 
     text = update.message.text
@@ -216,8 +286,8 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "💡 <b>Capture an idea</b>\n\n"
             "Usage: <code>/idea your thought here</code>\n"
-            "Include URLs, project names, anything. The Senior PM agent processes "
-            "it overnight and routes to the right project's next board meeting.",
+            "Include URLs, project names, anything. Creates a Linear triage "
+            "ticket immediately and the Senior PM agent routes it.",
             parse_mode="HTML",
         )
         return
@@ -227,6 +297,24 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_name = user.first_name if user else "unknown"
     chat_id = update.effective_chat.id if update.effective_chat else 0
 
+    # Stage 1 — Linear direct call (primary path)
+    api_key = (os.environ.get("LINEAR_API_KEY") or "").strip()
+    linear_ok = False
+    linear_id = ""
+    linear_url = ""
+    linear_err = ""
+    if api_key:
+        linear_ok, payload, linear_url = _linear_create_issue_from_idea(
+            api_key, text, user_name, user_id, chat_id, update.message.message_id
+        )
+        if linear_ok:
+            linear_id = payload
+        else:
+            linear_err = payload
+    else:
+        linear_err = "LINEAR_API_KEY env var not set on bot"
+
+    # Stage 2 — JSONL audit trail (always, for idempotency + offline debugging)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -235,26 +323,43 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "chat_id": chat_id,
         "message_id": update.message.message_id,
         "text": text,
-        "processed": False,
+        "processed": linear_ok,
+        "linear_identifier": linear_id,
+        "linear_url": linear_url,
         "source": "telegram_idea_command",
     }
-
+    jsonl_ok = False
+    jsonl_err = ""
     try:
         inbox = _harness_dir() / "ideas-from-phone"
         inbox.mkdir(parents=True, exist_ok=True)
         with (inbox / f"{today}.jsonl").open("a") as f:
             f.write(json.dumps(record) + "\n")
+        jsonl_ok = True
     except Exception as exc:  # noqa: BLE001
-        logger.error("idea_command: failed to save: %s", exc)
+        jsonl_err = f"{type(exc).__name__}: {str(exc)[:120]}"
+        logger.warning("idea_command: jsonl audit write failed: %s", exc)
+
+    # Terminal state — surface honestly, no silent success (RA-1109)
+    preview = text[:80] + ("…" if len(text) > 80 else "")
+    if linear_ok:
         await update.message.reply_text(
-            f"❌ Failed to save idea: {_escape_html(str(exc)[:120])}",
+            f"✅ <b>Linear ticket created:</b> <code>{_escape_html(linear_id)}</code>\n"
+            f"{_escape_html(linear_url)}\n\n"
+            f"<i>{_escape_html(preview)}</i>",
             parse_mode="HTML",
+            disable_web_page_preview=False,
         )
         return
 
-    preview = text[:80] + ("…" if len(text) > 80 else "")
-    await update.message.reply_text(
-        f"💡 <b>Captured.</b> Will be processed in the next overnight cycle.\n\n"
-        f"<i>{_escape_html(preview)}</i>",
-        parse_mode="HTML",
+    # Linear failed — tell the user why, both stages
+    msg = (
+        f"⚠ <b>Linear ticket NOT created.</b>\n"
+        f"Reason: <code>{_escape_html(linear_err[:160])}</code>\n\n"
     )
+    if jsonl_ok:
+        msg += "Captured to local JSONL audit trail only.\n\n"
+    else:
+        msg += f"❌ JSONL audit also failed: <code>{_escape_html(jsonl_err)}</code>\n\n"
+    msg += f"<i>{_escape_html(preview)}</i>"
+    await update.message.reply_text(msg, parse_mode="HTML")
