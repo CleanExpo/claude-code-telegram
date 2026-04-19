@@ -107,10 +107,42 @@ class ClaudeCodeBot:
         logger.info("Bot initialization complete")
 
     async def _set_bot_commands(self) -> None:
-        """Set bot command menu via orchestrator."""
+        """Set bot command menu via orchestrator.
+
+        Calls Telegram setMyCommands with a single retry so a transient
+        DNS/timeout on boot does not leave the menu stale after a
+        redeploy (see #9 — PR #9 merged correctly but the Telegram
+        getMyCommands endpoint kept returning the old 9-command list
+        because the Railway webhook missed the merge and no fresh
+        container ever re-registered the menu).
+        """
         commands = await self.orchestrator.get_bot_commands()
-        await self.app.bot.set_my_commands(commands)
-        logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
+        command_names = [cmd.command for cmd in commands]
+        last_err: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                await self.app.bot.set_my_commands(commands)
+                logger.info(
+                    "Bot commands set",
+                    count=len(commands),
+                    commands=command_names,
+                    attempt=attempt,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — we log and retry
+                last_err = exc
+                logger.warning(
+                    "set_my_commands failed, will retry",
+                    error=str(exc),
+                    attempt=attempt,
+                )
+                await asyncio.sleep(2)
+        logger.error(
+            "Bot commands not registered after retry",
+            error=str(last_err),
+            count=len(commands),
+            commands=command_names,
+        )
 
     def _register_handlers(self) -> None:
         """Register handlers via orchestrator (mode-aware)."""
