@@ -4,9 +4,10 @@ WORKDIR /app
 
 # Install system dependencies
 # RA-1442: cmake + build-essential + libopenblas added for optional face-recognition
-# extra (dlib compiles from source). Kept lightweight — only installs if
-# ENABLE_FACE_AUTH=1 at build time.
-ARG ENABLE_FACE_AUTH=0
+# extra (dlib compiles from source).
+# RA-1457: default flipped to 1 — user asked for face-auth on by default.
+# Override with --build-arg ENABLE_FACE_AUTH=0 to skip dlib compile (faster build).
+ARG ENABLE_FACE_AUTH=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
