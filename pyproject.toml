@@ -86,7 +86,10 @@ line_length = 88
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
-addopts = "-v --cov=src --cov-report=html --cov-report=term-missing"
+# RA-1441: coverage flags moved out of default addopts so `pytest` runs in any
+# env without pytest-cov installed. For coverage runs:
+#   poetry run pytest --cov=src --cov-report=html --cov-report=term-missing
+addopts = "-v"
 asyncio_mode = "auto"
 
 [tool.mypy]
