@@ -436,6 +436,15 @@ class MessageOrchestrator:
             )
         )
 
+        # RA-1457 — phone-companion authority-prompt callbacks (approve:/deny:)
+        from .handlers import phone_gate
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(phone_gate.phone_gate_callback),
+                pattern=r"^(approve|deny):",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
