@@ -51,7 +51,12 @@ except ImportError:
 
 # ── Config ──────────────────────────────────────────────────────────────────
 _DB_PATH = Path.home() / ".pi-ceo" / "face_auth.sqlite"
-_SIMILARITY_THRESHOLD = 0.6  # cosine similarity; 0.6+ = match (face_recognition default 0.6)
+# face_recognition's default comparison is EUCLIDEAN DISTANCE on 128-float
+# embeddings; typical same-face distance is 0.3-0.5, different faces 0.6+.
+# A "match" means distance <= threshold — NOT similarity >= threshold. The
+# earlier code inverted this by computing `similarity = 1 - distance` and
+# comparing >= 0.6, which rejected nearly every legitimate selfie.
+_DISTANCE_THRESHOLD = 0.6  # same as face_recognition.compare_faces default
 _FACE_AUTH_TTL = 600  # 10 minutes of granted access after successful /lock
 _MAX_FAILED_ATTEMPTS = 3
 _COOLDOWN_SECONDS = 300  # 5 min lockout after 3 failures
@@ -123,7 +128,7 @@ def is_face_authorised(user_id: int) -> bool:
     face_recognition installed.
     """
     if not _FACE_LIB_AVAILABLE:
-        return True  # graceful degradation
+        return True  # graceful degradation — lib not installed, chat_id whitelist only
     try:
         with _init_db() as conn:
             row = conn.execute(
@@ -135,8 +140,11 @@ def is_face_authorised(user_id: int) -> bool:
         granted_at = row[0]
         return (time.time() - granted_at) < _FACE_AUTH_TTL
     except Exception as exc:  # noqa: BLE001
-        logger.warning("is_face_authorised error (fail-open): %s", exc)
-        return True  # don't lock out on internal errors
+        # Fail CLOSED on internal errors (e.g. SQLite corruption, permission
+        # denied). The gate protects destructive commands; a DB error is
+        # not a signal to let the user through. Log loud and deny.
+        logger.error("is_face_authorised internal error (fail-closed): %s", exc)
+        return False
 
 
 def enroll_from_photo_bytes(user_id: int, photo_bytes: bytes) -> VerificationResult:
@@ -233,12 +241,11 @@ def verify_from_photo_bytes(
 
             stored = np.frombuffer(row[0], dtype=np.float64)
             presented = embeddings[0]
-            # face_recognition uses euclidean distance; lower is better
+            # face_recognition.compare_faces uses euclidean distance with a
+            # default threshold of 0.6 — distance <= 0.6 is a match.
             distance = float(np.linalg.norm(stored - presented))
-            # Convert to similarity in [0,1], 1=identical
-            similarity = max(0.0, 1.0 - distance)
 
-            if similarity >= _SIMILARITY_THRESHOLD:
+            if distance <= _DISTANCE_THRESHOLD:
                 conn.execute(
                     "INSERT OR REPLACE INTO face_sessions "
                     "(user_id, granted_at, failed_count, cooldown_until) "
@@ -246,10 +253,12 @@ def verify_from_photo_bytes(
                     (user_id, time.time()),
                 )
                 conn.commit()
-                return VerificationResult(True, "verified", similarity=similarity)
+                # Keep `similarity` on the result for human-readable debug
+                # output; it's cosmetic and not used for auth decisions.
+                return VerificationResult(True, "verified", similarity=1.0 - distance)
 
-            # Failed attempt
-            new_count = ((row[0] if row else 0) or 0) + 1
+            # Failed attempt — increment the session row's failed_count and
+            # apply cooldown once MAX_FAILED_ATTEMPTS is reached.
             row_sessions = conn.execute(
                 "SELECT failed_count FROM face_sessions WHERE user_id = ?",
                 (user_id,),
@@ -269,8 +278,8 @@ def verify_from_photo_bytes(
             conn.commit()
             return VerificationResult(
                 False,
-                f"similarity {similarity:.2f} below threshold {_SIMILARITY_THRESHOLD}",
-                similarity=similarity,
+                f"distance {distance:.2f} above threshold {_DISTANCE_THRESHOLD}",
+                similarity=1.0 - distance,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("verify_from_photo_bytes error: %s", exc)
