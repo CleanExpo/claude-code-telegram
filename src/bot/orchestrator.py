@@ -318,7 +318,7 @@ class MessageOrchestrator:
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command, remote_control
+        from .handlers import command, remote_control, second_brain
 
         # Commands
         handlers = [
@@ -332,6 +332,13 @@ class MessageOrchestrator:
             ("projects", remote_control.projects_command),
             ("health", remote_control.health_command),
             ("idea", remote_control.idea_command),
+            # Mobile second-brain commands — backend-proxied Linear + pipeline
+            ("linear", second_brain.linear_command),
+            ("issue", second_brain.status_command),  # /issue RA-xxxx (avoid /status collision)
+            ("pipeline", second_brain.pipeline_command),
+            ("ship", second_brain.ship_command),
+            ("plan", second_brain.plan_command),
+            ("digest", second_brain.digest_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -401,11 +408,19 @@ class MessageOrchestrator:
         )
 
         # RA-1101 — proj: callbacks for the /projects InlineKeyboard dropdown
-        from .handlers import remote_control
+        from .handlers import remote_control, second_brain
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(remote_control.projects_callback),
                 pattern=r"^proj:",
+            )
+        )
+
+        # Mobile second-brain inline-button callbacks (sbpipe:*, sbship:*)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(second_brain.second_brain_callback),
+                pattern=r"^sb(pipe|ship):",
             )
         )
 
