@@ -318,7 +318,7 @@ class MessageOrchestrator:
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command, remote_control, second_brain
+        from .handlers import command, remote_control, second_brain, face_entry
 
         # Commands
         handlers = [
@@ -339,6 +339,11 @@ class MessageOrchestrator:
             ("ship", second_brain.ship_command),
             ("plan", second_brain.plan_command),
             ("digest", second_brain.digest_command),
+            # RA-1442 — face-auth entry gate for destructive commands
+            ("enroll", face_entry.enroll_command),
+            ("lock", face_entry.lock_command),
+            ("revoke", face_entry.revoke_command),
+            ("whoami_face", face_entry.whoami_command),  # /whoami_face (avoid potential collision)
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -379,10 +384,16 @@ class MessageOrchestrator:
             group=10,
         )
 
-        # Photo uploads -> Claude
+        # RA-1442 — face-auth photo interceptor (runs BEFORE agentic_photo).
+        # If the user is in /enroll or /lock step, we consume the photo. Otherwise
+        # the photo falls through to agentic_photo in group 10.
+        async def _face_photo_or_passthrough(update, ctx):
+            consumed = await face_entry.face_photo_handler(update, ctx)
+            if not consumed:
+                await self.agentic_photo(update, ctx)
         app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(self.agentic_photo)),
-            group=10,
+            MessageHandler(filters.PHOTO, self._inject_deps(_face_photo_or_passthrough)),
+            group=5,  # lower number = earlier priority
         )
 
         # Voice messages -> transcribe -> Claude
