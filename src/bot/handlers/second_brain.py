@@ -31,6 +31,31 @@ from telegram.ext import ContextTypes
 logger = logging.getLogger(__name__)
 
 
+# ── Module-load env validation (RA-1441) ───────────────────────────────────
+def _validate_env_at_load() -> None:
+    """Log WARNING once at import time if required env is missing.
+
+    Handlers still degrade gracefully per-call (the user sees
+    "PI_CEO_PASSWORD ... not set on bot"), but surfacing the misconfiguration
+    at process boot means operators see it in the very first log line rather
+    than only when a user tries to use /linear at 2am.
+    """
+    import os
+
+    missing = []
+    if not (os.environ.get("PI_CEO_PASSWORD") or os.environ.get("TAO_PASSWORD")):
+        missing.append("PI_CEO_PASSWORD or TAO_PASSWORD")
+    if missing:
+        logger.warning(
+            "second_brain: bot will reject /linear /issue /pipeline /ship /plan "
+            "/digest until env is fixed. Missing: %s",
+            ", ".join(missing),
+        )
+
+
+_validate_env_at_load()
+
+
 # ── Shared backend client (lazy) ────────────────────────────────────────────
 def _backend_url() -> str:
     import os
