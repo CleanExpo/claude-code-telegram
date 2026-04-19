@@ -343,6 +343,7 @@ class MessageOrchestrator:
             ("enroll", face_entry.enroll_command),
             ("lock", face_entry.lock_command),
             ("revoke", face_entry.revoke_command),
+            ("cancel", face_entry.cancel_command),
             ("whoami_face", face_entry.whoami_command),  # /whoami_face (avoid potential collision)
         ]
         if self.settings.enable_project_threads:
@@ -491,9 +492,17 @@ class MessageOrchestrator:
         logger.info("Classic handlers registered (13 commands + full handler set)")
 
     async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
-        """Return bot commands appropriate for current mode."""
+        """Return bot commands appropriate for current mode.
+
+        Telegram's command menu is built from whatever this returns, so
+        every CommandHandler you register must also appear here or users
+        can't discover it. Missing entries show up as "typed commands work
+        but the / menu is a lie" — most users won't know the command
+        exists at all.
+        """
         if self.settings.agentic_mode:
             commands = [
+                # Core session controls
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
@@ -503,6 +512,20 @@ class MessageOrchestrator:
                 BotCommand("projects", "Pick a project (tappable dropdown)"),
                 BotCommand("health", "Portfolio health (all projects)"),
                 BotCommand("idea", "Capture an idea for the next board meeting"),
+                # RA-1440 / PR #3 — second-brain mobile commands
+                BotCommand("linear", "Create a Linear issue from chat"),
+                BotCommand("issue", "Look up a Linear issue (e.g. /issue RA-1234)"),
+                BotCommand("pipeline", "Show build-session phases for an issue"),
+                BotCommand("ship", "Trigger ship_build for an approved issue"),
+                BotCommand("plan", "Generate a build plan from a brief"),
+                BotCommand("digest", "On-demand portfolio digest"),
+                # RA-1442 / PR #5 — face-auth gate for destructive commands
+                BotCommand("enroll", "Enrol your face (send a selfie after)"),
+                BotCommand("lock", "Unlock destructive commands via selfie"),
+                BotCommand("revoke", "Revoke the current face-auth token"),
+                BotCommand("whoami_face", "Show face-auth status"),
+                BotCommand("cancel", "Cancel the current /enroll or /lock flow"),
+                # Admin
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:

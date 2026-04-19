@@ -109,62 +109,121 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ── Login cookie cache ─────────────────────────────────────────────────────
+# Earlier every /linear /ship /plan /issue /pipeline /digest call paid a
+# round-trip to /api/login (two HTTPS calls instead of one, double rate
+# pressure on the auth endpoint). Cookie is cached in-process with a TTL
+# conservatively shorter than the server's session lifetime. On 401 we
+# invalidate and re-login once, then retry — so a server-side session
+# expiry or bot restart self-heals on the next command.
+import asyncio as _asyncio
+import time as _time
+
+_BACKEND_COOKIE_TTL_SECONDS = 30 * 60  # 30 min — server session is 1h+
+_cookie_cache: dict = {"value": None, "expires_at": 0.0}
+_cookie_lock = _asyncio.Lock()
+
+
+async def _get_or_refresh_cookie(force_refresh: bool = False) -> tuple[bool, str]:
+    """Return (ok, cookie_or_error). Cookie is shared across coroutines."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    async with _cookie_lock:
+        now = _time.time()
+        cached = _cookie_cache.get("value")
+        expires_at = float(_cookie_cache.get("expires_at", 0.0))
+        if cached and not force_refresh and now < expires_at:
+            return True, cached
+
+        pw = _backend_pw()
+        if not pw:
+            return False, "PI_CEO_PASSWORD / TAO_PASSWORD env var not set on bot"
+
+        backend = _backend_url()
+        try:
+            login_data = json.dumps({"password": pw}).encode()
+            login_req = urllib.request.Request(
+                f"{backend}/api/login",
+                data=login_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(login_req, timeout=10) as resp:
+                cookie_header = resp.headers.get("set-cookie", "")
+                cookie = cookie_header.split(";")[0] if cookie_header else ""
+            if not cookie:
+                return False, "backend login failed — check password"
+        except (urllib.error.URLError, TimeoutError) as exc:
+            return False, f"login transport error: {exc}"
+
+        _cookie_cache["value"] = cookie
+        _cookie_cache["expires_at"] = now + _BACKEND_COOKIE_TTL_SECONDS
+        return True, cookie
+
+
 async def _backend_call(
     path: str,
     method: str = "GET",
     payload: dict | None = None,
     timeout: int = 20,
 ) -> tuple[bool, dict | str]:
-    """Call a Pi-CEO backend route with the TAO password cookie.
+    """Call a Pi-CEO backend route with the (cached) TAO password cookie.
 
-    Returns (ok, result). On failure, result is an error string.
+    Returns (ok, result). On failure, result is an error string. A single
+    401 retry uses a freshly-minted cookie before giving up — covers server
+    restarts without punishing every subsequent call with a re-login.
     """
     import json
     import urllib.error
     import urllib.request
 
-    pw = _backend_pw()
-    if not pw:
-        return False, "PI_CEO_PASSWORD / TAO_PASSWORD env var not set on bot"
-
     backend = _backend_url()
 
-    try:
-        login_data = json.dumps({"password": pw}).encode()
-        login_req = urllib.request.Request(
-            f"{backend}/api/login",
-            data=login_data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(login_req, timeout=10) as resp:
-            cookie_header = resp.headers.get("set-cookie", "")
-            cookie = cookie_header.split(";")[0] if cookie_header else ""
-        if not cookie:
-            return False, "backend login failed — check password"
-    except (urllib.error.URLError, TimeoutError) as exc:
-        return False, f"login transport error: {exc}"
+    async def _do_request(cookie: str) -> tuple[bool, dict | str, int | None]:
+        try:
+            headers = {"Cookie": cookie}
+            if method == "GET":
+                req = urllib.request.Request(f"{backend}{path}", headers=headers)
+            else:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload or {}).encode()
+                req = urllib.request.Request(
+                    f"{backend}{path}",
+                    data=body,
+                    headers=headers,
+                    method=method,
+                )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode()
+                return True, (json.loads(raw) if raw else {}), resp.status
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="ignore")[:300]
+            return False, f"HTTP {exc.code}: {body}", exc.code
+        except (urllib.error.URLError, TimeoutError) as exc:
+            return False, f"transport error: {exc}", None
+        except json.JSONDecodeError as exc:
+            return False, f"bad JSON from backend: {exc}", None
 
-    try:
-        headers = {"Cookie": cookie}
-        if method == "GET":
-            req = urllib.request.Request(f"{backend}{path}", headers=headers)
-        else:
-            headers["Content-Type"] = "application/json"
-            body = json.dumps(payload or {}).encode()
-            req = urllib.request.Request(
-                f"{backend}{path}", data=body, headers=headers, method=method
-            )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode()
-            return True, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="ignore")[:300]
-        return False, f"HTTP {exc.code}: {body}"
-    except (urllib.error.URLError, TimeoutError) as exc:
-        return False, f"transport error: {exc}"
-    except json.JSONDecodeError as exc:
-        return False, f"bad JSON from backend: {exc}"
+    ok, cookie = await _get_or_refresh_cookie()
+    if not ok:
+        return False, cookie
+
+    ok, result, status = await _do_request(cookie)
+    if ok:
+        return True, result
+
+    # Cookie may have expired server-side — refresh once and retry.
+    if status == 401:
+        ok2, cookie2 = await _get_or_refresh_cookie(force_refresh=True)
+        if not ok2:
+            return False, cookie2
+        ok, result, _ = await _do_request(cookie2)
+        if ok:
+            return True, result
+
+    return False, result
 
 
 # ── /linear ─────────────────────────────────────────────────────────────────
