@@ -56,6 +56,34 @@ def _validate_env_at_load() -> None:
 _validate_env_at_load()
 
 
+# ── Face-auth gate for destructive commands (RA-1442) ──────────────────────
+async def _require_face_auth(update: Update) -> bool:
+    """Return True if the user has a fresh face-auth token OR if face lib
+    isn't installed (graceful degrade). Replies to the user on failure.
+    """
+    try:
+        from src.security import face_auth  # noqa: PLC0415
+
+        if not update.effective_user or not update.message:
+            return False
+        user_id = update.effective_user.id
+        if face_auth.is_face_authorised(user_id):
+            return True
+        # Unauthorised — reply with helpful message
+        reason = (
+            "Not enrolled — send /enroll to set your reference selfie, then /lock."
+            if not face_auth.is_enrolled(user_id)
+            else "Face-auth session expired — send /lock and a selfie to re-authorise."
+        )
+        await update.message.reply_text(
+            f"🔒 <b>Face-auth required</b>\n\n{reason}", parse_mode="HTML"
+        )
+        return False
+    except ImportError:
+        # face_auth module itself is missing — fail-open
+        return True
+
+
 # ── Shared backend client (lazy) ────────────────────────────────────────────
 def _backend_url() -> str:
     import os
@@ -159,6 +187,10 @@ async def linear_command(
             "or falls back to Pi-Dev-Ops.",
             parse_mode="HTML",
         )
+        return
+
+    # RA-1442 — face-auth gate for destructive /linear
+    if not await _require_face_auth(update):
         return
 
     await update.message.reply_text("📝 Creating ticket...", parse_mode="HTML")
@@ -322,6 +354,10 @@ async def ship_command(
         return
 
     issue_id = parts[1].strip().upper()
+    # RA-1442 — face-auth gate for destructive /ship
+    if not await _require_face_auth(update):
+        return
+
     await update.message.reply_text(
         f"🚀 Triggering ship for {_escape_html(issue_id)}... "
         "This can take minutes; I'll report the result.",
@@ -367,6 +403,10 @@ async def plan_command(
             "Usage: <code>/plan add dark mode toggle to CARSI dashboard</code>",
             parse_mode="HTML",
         )
+        return
+
+    # RA-1442 — face-auth gate for destructive /plan
+    if not await _require_face_auth(update):
         return
 
     await update.message.reply_text(
